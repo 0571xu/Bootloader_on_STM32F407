@@ -1,0 +1,15 @@
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/queue.c
+bootloader_test\queue.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
+bootloader_test\queue.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/FreeRTOS.h
+bootloader_test\queue.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+bootloader_test\queue.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+bootloader_test\queue.o: ../Core/Inc/FreeRTOSConfig.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/projdefs.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/portable.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/deprecated_definitions.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/ARM_CM4F/portmacro.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/mpu_wrappers.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/task.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/list.h
+bootloader_test\queue.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/queue.h
