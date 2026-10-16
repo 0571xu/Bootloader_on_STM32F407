@@ -50,4 +50,5 @@ bootloader_test\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/event
 bootloader_test\main.o: ../Core/Inc/dma.h
 bootloader_test\main.o: ../Core/Inc/i2c.h
 bootloader_test\main.o: ../Core/Inc/usart.h
+bootloader_test\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/stream_buffer.h
 bootloader_test\main.o: ../Core/Inc/gpio.h

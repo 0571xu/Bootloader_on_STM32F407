@@ -1,5 +1,6 @@
 --cpu=Cortex-M4.fp.sp
 "bootloader_test\startup_stm32f407xx.o"
+"bootloader_test\ota_receive.o"
 "bootloader_test\main.o"
 "bootloader_test\gpio.o"
 "bootloader_test\freertos.o"
