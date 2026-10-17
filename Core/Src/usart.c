@@ -32,7 +32,11 @@ uint8_t send_buf[100]; //发送缓冲区
 
 /* 发送互斥锁：多个任务共用 USART1，必须串行发送 */
 osMutexDef(uartTxMutex);
-extren osMutexId uartTxMutexId;
+osMutexId uartTxMutexId;
+
+/* DMA 发送完成信号量：在 USART1 中断里释放，uart_send() 等它 */
+osSemaphoreDef(uartTxDone);
+osSemaphoreId uartTxDoneSem;
 
 /* USER CODE END 0 */
 
@@ -68,6 +72,21 @@ void MX_USART1_UART_Init(void)
 
   /* 创建串口发送互斥锁（此时调度器尚未启动，创建是安全的） */
   uartTxMutexId = osMutexCreate(osMutex(uartTxMutex));
+
+  /* CMSIS 封装里 count=1 表示创建“二值信号量”，且初始就有 1 个 token，这里取走使其为 0 */
+  uartTxDoneSem = osSemaphoreCreate(osSemaphore(uartTxDone), 1);
+  osSemaphoreWait(uartTxDoneSem, 0);
+
+  /*
+   * 接收 DMA 与空闲中断必须在这里启动，不能放在 HAL_UART_MspInit() 里：
+   * MspInit 是在 HAL_UART_Init() 内部调用的，那时 RxState 还不是 READY，
+   * HAL_UART_Receive_DMA() 会直接返回 HAL_BUSY，导致串口永远收不到数据。
+   */
+  __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);
+  if (HAL_UART_Receive_DMA(&huart1, CercleBuffer, CercleBufferSize) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END USART1_Init 2 */
 
@@ -139,8 +158,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 		HAL_NVIC_EnableIRQ(USART1_IRQn);
 	/* USER CODE BEGIN USART1_MspInit 1 */
 
-	__HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);//使能空闲中断
-	HAL_UART_Receive_DMA(&huart1, CercleBuffer, CercleBufferSize); //启动DMA接收
+	/* 空闲中断和 DMA 接收不在这里启动，见 MX_USART1_UART_Init() 末尾 */
 
 	/* USER CODE END USART1_MspInit 1 */
 	}
@@ -185,8 +203,18 @@ void uart_send(const uint8_t *data, uint16_t len)
   if (uartTxMutexId != NULL)
     osMutexWait(uartTxMutexId, osWaitForever);
 
-  HAL_UART_Transmit_DMA(&huart1, data, len);
+  if (uartTxDoneSem != NULL)
+    osSemaphoreWait(uartTxDoneSem, 0); /* 清掉上一次可能残留的信号 */
 
+  /* 只有启动成功才等完成信号，否则会永远等不到（HAL_BUSY 时不会触发 TxCplt） */
+  if (HAL_UART_Transmit_DMA(&huart1, data, len) == HAL_OK)
+  {
+    if (uartTxDoneSem != NULL)
+      osSemaphoreWait(uartTxDoneSem, osWaitForever);
+  }
+
+  if (uartTxMutexId != NULL)
+    osMutexRelease(uartTxMutexId);
 }
 
 /* USER CODE END 1 */

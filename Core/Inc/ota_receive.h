@@ -9,27 +9,79 @@
 #include "queue.h"
 #include "task.h"
 
-/* ==================== Flash 地址 ==================== */
-#define BOOTLOADER_BASE     0x08000000
-#define APPLICATION_BASE    0x08003000
-#define OTA_BUFFER_BASE     0x0800C000
-#define CONFIG_BASE         0x0800F800
-#define OTA_BUFFER_SIZE     (36 * 1024)
-#define FLASH_PAGE_SIZE     1024
+/* ==================== Flash 分区 ==================== */
+/*
+ * 0x08000000 - 0x08007FFF  Bootloader   S0 ~ S1  (32KB)
+ * 0x08008000 - 0x0800BFFF  元数据副本 0  S2       (16KB)
+ * 0x0800C000 - 0x0800FFFF  元数据副本 1  S3       (16KB)
+ * 0x08010000 - 0x0807FFFF  APP A        S4 ~ S7  (448KB)
+ * 0x08080000 - 0x080FFFFF  APP B        S8 ~ S11 (物理 512KB，可用 448KB)
+ *
+ * 两个槽的“可用容量”必须一致（都按 448KB 限制），否则某个镜像能放进 B 却放不进 A。
+ * 两份元数据必须位于不同扇区：擦除粒度是扇区，同扇区会一擦全没。
+ */
+#define BOOTLOADER_BASE     0x08000000U
+#define BOOTLOADER_SIZE     (32U * 1024U)
+
+#define SLOT_A_BASE         0x08010000U
+#define SLOT_B_BASE         0x08080000U
+#define SLOT_CAPACITY       (448U * 1024U)
+#define SLOT_A_END          (SLOT_A_BASE + SLOT_CAPACITY)   /* 0x08080000 */
+#define SLOT_B_END          (SLOT_B_BASE + SLOT_CAPACITY)   /* 0x080F0000，可用上限 */
+#define SLOT_B_ERASE_END    0x08100000U                     /* B 物理末端，S11 末尾 */
+
+#define META0_BASE          0x08008000U
+#define META1_BASE          0x0800C000U
+#define META_SECTOR_SIZE    (16U * 1024U)                   /* S2、S3 均为 16KB */
+
+#define FLASH_BASE_ADDR     0x08000000U
+#define FLASH_END_ADDR      0x08100000U
+
+/*
+ * 当前 APP 构建版本链接到哪个槽。
+ *   默认（不定义 APP_SLOT_B）：A 版镜像，链接地址 0x08010000
+ *   定义 APP_SLOT_B        ：B 版镜像，链接地址 0x08080000
+ *
+ * 运行在哪个槽由链接地址唯一确定，不能靠元数据去猜：
+ * 一旦元数据与实际运行槽不一致，就可能把正在运行的固件擦掉。
+ */
+#ifdef APP_SLOT_B
+#define APP_IMAGE_BASE      SLOT_B_BASE
+#define APP_IMAGE_SLOT      1U
+#else
+#define APP_IMAGE_BASE      SLOT_A_BASE
+#define APP_IMAGE_SLOT      0U
+#endif
 
 /* ==================== OTA 参数区结构 ==================== */
-#define OTA_MAGIC           0xDEADBEEFU
-#define CURRENT_VERSION     0x00010000U   /* V1.0 */
+#define OTA_META_MAGIC      0x4F544131U      /* "OTA1"，与 Bootloader 保持一致 */
+#define CURRENT_VERSION     0x00010000U      /* V1.0 */
+
+#define OTA_MAX_TOTAL_CHUNKS        2048U
+#define OTA_BITMAP_WORD_COUNT       ((OTA_MAX_TOTAL_CHUNKS + 7U) / 8U)  /* 每 8 包 1 字节 */
+
+#define SLOT_STATE_EMPTY    0U
+#define SLOT_STATE_VALID    1U
+#define SLOT_STATE_INVALID  2U
 
 #pragma pack(1)
 typedef struct {
-    uint32_t magic;
-    uint32_t update_flag;
-    uint32_t version;
-    uint32_t firmware_size;
-    uint32_t crc32;
+    uint32_t magic;          /* 固定标识 0x4F544131 */
+    uint32_t seq;            /* 写入序号，越大越新（用于判定有效副本） */
+    uint8_t  active_slot;    /* 本次启动的槽：0 = A，1 = B */
+    uint8_t  trial_pending;  /* 1 = 新固件待确认 */
+    uint8_t  slot_state[2];  /* 各槽状态：EMPTY / VALID / INVALID */
+    uint8_t  reserved;
+    uint32_t version[2];     /* 各槽固件版本号 */
+    uint32_t firmware_size;  /* 当前活动槽固件长度（0 表示未知，跳过 CRC） */
+    uint32_t fw_crc;         /* 当前活动槽整包 CRC32 */
+    uint8_t  rx_bitmap[OTA_BITMAP_WORD_COUNT];   /* 断点续传：已收包位图 */
+    uint32_t meta_crc;       /* 本结构 CRC32，计算时该字段按 0xFFFFFFFF 处理 */
 } ota_config_t;
 #pragma pack()
+
+/* Bootloader 与 APP 的结构体布局必须一致 */
+typedef char ota_config_size_check[(sizeof(ota_config_t) == 289) ? 1 : -1];
 
 /* ==================== 帧格式 ==================== */
 #define DATA_FRAME_LEN      256
@@ -86,16 +138,27 @@ extern QueueHandle_t        atQueue;
 extern TaskHandle_t xrequest_upgrade_taskHandle;
 extern TaskHandle_t xWifisendTaskHandle;
 
-
 /* ==================== 函数声明 ==================== */
 void           ota_receive_init(void);
 frame_slot_t*  frame_pool_alloc(void);
 void           frame_pool_free(frame_slot_t *slot);
 uint32_t       calculate_crc32_ex(uint8_t total, uint8_t current, uint16_t len, uint8_t *data);
-void           trigger_upgrade(void);
 
+/* 整包 / 元数据 CRC（与 Bootloader 使用同一套算法） */
+uint32_t       ota_crc32_bytes(const void *data, uint32_t len);
+
+/* 元数据双副本：seq 大且 meta_crc 正确的一份生效 */
+int            ota_meta_load(ota_config_t *out);
+int            ota_meta_save(ota_config_t *cfg);
+
+/* APP 启动时确认当前运行的槽，并清掉 trial_pending */
+void           ota_app_boot_confirm(uint32_t image_base);
+int            ota_image_vectors_valid(uint32_t slot_base);
 
 /* Flash 接口 */
+uint32_t       get_sector(uint32_t addr);        /* 获取地址所在扇区号 */
+uint32_t       get_sector_base(uint32_t addr);  /* 获取地址所在扇区基址 */
+uint32_t       get_sector_size(uint32_t sector);/* 扇区大小：16KB / 64KB / 128KB */
 extern StatusTypeDef  flash_erase(uint32_t start_addr, uint32_t size);
 extern StatusTypeDef  flash_write(uint32_t dest_addr, uint8_t *src, uint32_t size);
 

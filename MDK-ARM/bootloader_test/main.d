@@ -52,3 +52,5 @@ bootloader_test\main.o: ../Core/Inc/i2c.h
 bootloader_test\main.o: ../Core/Inc/usart.h
 bootloader_test\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/stream_buffer.h
 bootloader_test\main.o: ../Core/Inc/gpio.h
+bootloader_test\main.o: ../Core/Inc/ota_receive.h
+bootloader_test\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h

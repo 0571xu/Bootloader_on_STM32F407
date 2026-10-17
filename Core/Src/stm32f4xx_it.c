@@ -191,7 +191,9 @@ void USART1_IRQHandler(void)
 	/* USER CODE BEGIN USART1_IRQn 0 */
 	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-	if (__HAL_UART_GET_IT_SOURCE(&huart1, UART_FLAG_IDLE) != RESET) // 检测是否发生了空闲事件
+	/* 必须查 IDLE 标志，不能查 IT_SOURCE：UART_FLAG_IDLE(0x10) 拿去查中断使能位恒为真，
+	   那样每个 USART1 中断（包括发送完成）都会当成空闲事件处理 */
+	if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_IDLE) != RESET) // 检测是否发生了空闲事件
 	{
 		uint16_t write_pos;
 		uint16_t len;

@@ -26,7 +26,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "ota_receive.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -70,7 +70,8 @@ int main(void)
 {
 
 	/* USER CODE BEGIN 1 */
-
+	/* 向量表必须指向本镜像实际链接的槽：A 版 0x08010000，B 版 0x08080000 */
+	SCB->VTOR = APP_IMAGE_BASE;
 	/* USER CODE END 1 */
 
 	/* MCU Configuration--------------------------------------------------------*/
@@ -101,6 +102,14 @@ int main(void)
 	GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
 	GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_MEDIUM;
 	HAL_GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+	/*
+	 * 启动确认：
+	 *   1. 新固件被 Bootloader 跳转起来后，这里清掉 trial_pending；
+	 *   2. 首次上电元数据为空时，用当前运行槽建立第一份元数据；
+	 *   3. Bootloader 若做过槽回退，这里把 active_slot 修正回实际运行槽。
+	 */
+	ota_app_boot_confirm(APP_IMAGE_BASE);
 
 	/* USER CODE END 2 */
 

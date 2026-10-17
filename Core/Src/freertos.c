@@ -26,6 +26,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stm32f4xx_hal.h"
+#include <stdio.h>
+#include "string.h"
 #include "usart.h"
 #include "ota_receive.h"
 #include "stream_buffer.h"
@@ -53,6 +55,7 @@
 /* 结束帧解析出的固件信息，供 request_upgrade_task 写入 config */
 static uint32_t g_firmware_size = 0;
 static uint32_t g_firmware_crc  = 0;
+static uint32_t g_target_slot   = 0;   /* 本次下载写入的槽：0 = A，1 = B */
 
 /* USER CODE END Variables */
 osThreadId ledHandle;
@@ -158,10 +161,6 @@ void ledTask(void const *argument)
 	/* USER CODE BEGIN ledTask */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1,GPIO_PIN_RESET);
     osDelay(500);
-	
-	// char *str3 = "jump success!\r\n";
-	// int len3 = strlen(str3);
-	// HAL_UART_Transmit(&huart1, (uint8_t *)str3, len3, HAL_MAX_DELAY);
 
 	/* Infinite loop */
 	for (;;)
@@ -188,7 +187,7 @@ void oledmenuTask(void const *argument)
 	{
 		static const char msg[] = "here is oledmenuTask!\r\n";
 		uart_send((const uint8_t *)msg, sizeof(msg) - 1);
-		osDelay(1000);
+		osDelay(10000);
 	}
 	/* USER CODE END oledmenuTask */
 }
@@ -215,15 +214,31 @@ void wifi_getTask(void const *argument)
 	memset(&parser, 0, sizeof(parser));
 	parser.state = 0; /* ST_HEADER_1 */
 
+	TickType_t last_report = xTaskGetTickCount();
+
 	for (;;)
 	{
+		/*
+		 * 每秒打印一次状态。
+		 * 注意：这里不能调用 osDelay()，否则整个循环被拖成 1 字节/秒，
+		 * OTA 数据会被 StreamBuffer 丢弃，永远收不到结束帧。
+		 */
+//		if ((xTaskGetTickCount() - last_report) >= pdMS_TO_TICKS(1000))
+//		{
+//			char version_str[32];
+//			last_report = xTaskGetTickCount();
 
-		static const char msg[] = "here is wifi_getTask!\r\n";
-		uart_send((const uint8_t *)msg, sizeof(msg) - 1);
-		osDelay(1000);
+//			/* 将 0x00010001 拆解成 V1.1 的字符串 */
+//			sprintf(version_str, "Version: V%d.%d\r\n",
+//			        (CURRENT_VERSION >> 16) & 0xFF, CURRENT_VERSION & 0xFF);
+//			uart_send((uint8_t *)version_str, strlen(version_str));
 
-		/* 一次读一个字节 */
-		if (xStreamBufferReceive(uartStreamBuffer, &byte, 1, portMAX_DELAY) != 1)
+//			static const char msg[] = "here is wifi_getTask!\r\n";
+//			uart_send((const uint8_t *)msg, sizeof(msg) - 1);
+//		}
+
+		/* 一次读一个字节；20ms 超时只是为了回到循环顶部打印状态 */
+		if (xStreamBufferReceive(uartStreamBuffer, &byte, 1, pdMS_TO_TICKS(20)) != 1)
 			continue;
 
 		/* ---------- 状态机 ---------- */
@@ -428,16 +443,15 @@ void ota_flashTask(void const *argument)
 
 	fw_frame_t frame;
 	uint32_t write_addr;
-	uint32_t received_count = 0; /* 已成功写入的数据帧数，用于收齐校验 */
-	int32_t erased_page = -1;	 /* 已擦除的 OTA 区页号；-1 表示本次尚未擦除 */
+	uint32_t received_count = 0;        /* 已成功写入的数据帧数，用于收齐校验 */
+	uint32_t erased_sector_base = 0xFFFFFFFFU;  /* 本次传输已擦除的扇区基址 */
+	uint32_t target_base = 0;           /* 本次传输的目标槽基址 */
+	uint32_t target_slot = 0;           /* 本次传输的目标槽：0 = A，1 = B */
+
+	(void)argument;
 
 	for (;;)
 	{
-
-		static const char msg[] = "here is ota_flashTask!\r\n";
-		uart_send((const uint8_t *)msg, sizeof(msg) - 1);
-		osDelay(1000);
-
 		if (xQueueReceive(xFrameQueue, &frame, portMAX_DELAY) != pdTRUE)
 			continue;
 
@@ -446,6 +460,7 @@ void ota_flashTask(void const *argument)
 		{
 			uint32_t fw_size = 0;
 			uint32_t fw_crc = 0;
+			int verified = 0;
 
 			/* 结束帧负载：data[0:4]=固件总长(小端), data[4:8]=整包 CRC32(小端) */
 			if (frame.data_len >= 8)
@@ -455,56 +470,95 @@ void ota_flashTask(void const *argument)
 			}
 			frame_pool_free(frame.slot);
 
-			/* 收齐校验：已收数据帧数必须等于总包数，否则丢弃本次升级 */
-			if (fw_size != 0 && received_count == frame.total_packets)
+			/*
+			 * 全量校验：收齐包数 + 直接读回目标槽算整包 CRC + 向量表检查。
+			 * 只有这三项都通过，才允许把 active_slot 切到新槽。
+			 */
+			if (target_base != 0U && fw_size != 0U && fw_size <= SLOT_CAPACITY &&
+			    received_count == frame.total_packets)
 			{
-				g_firmware_size = fw_size;
-				g_firmware_crc = fw_crc;
+				uint32_t calc_crc = ota_crc32_bytes((const void *)target_base, fw_size);
+
+				if (calc_crc == fw_crc && ota_image_vectors_valid(target_base))
+				{
+					g_firmware_size = fw_size;
+					g_firmware_crc  = fw_crc;
+					g_target_slot   = target_slot;
+					verified = 1;
+				}
+			}
+
+			if (verified)
+			{
 				xTaskNotify(xrequest_upgrade_taskHandle, 0x01, eSetValueWithOverwrite);
 			}
+			else
+			{
+				char err[72];
+				int n = sprintf(err, "ota verify fail! recv=%lu/%u size=%lu\r\n",
+				                (unsigned long)received_count,
+				                (unsigned int)frame.total_packets,
+				                (unsigned long)fw_size);
+				uart_send((const uint8_t *)err, (uint32_t)n);
+			}
+
 			received_count = 0;
-			erased_page = -1; /* 本次传输结束，下次重新擦除 */
-			continue;		  /* 结束帧不写 Flash，直接继续 */
+			erased_sector_base = 0xFFFFFFFFU;
+			target_base = 0;   /* 等待下一轮的包 0 */
+			continue;          /* 结束帧不写 Flash，直接继续 */
 		}
 
-		/* 新一轮传输开始，清零计数并强制重新擦除 */
+		/* 新一轮传输开始：目标槽 = 当前运行槽之外的另一个槽 */
 		if (frame.current_packet == 0)
 		{
 			received_count = 0;
-			erased_page = -1;
+			erased_sector_base = 0xFFFFFFFFU;
+
+			/*
+			 * 只用“本镜像的链接地址”判断当前运行槽，不去猜元数据。
+			 * 这样无论元数据是否损坏、是否与实际运行槽不一致，
+			 * 都绝不会把正在运行的固件擦掉。
+			 */
+			target_slot = (uint32_t)(APP_IMAGE_SLOT ^ 1U);
+			target_base = (target_slot == 0U) ? SLOT_A_BASE : SLOT_B_BASE;
 		}
 
-		write_addr = OTA_BUFFER_BASE + ((uint32_t)frame.current_packet * DATA_FRAME_LEN);
+		if (target_base == 0U)
+		{
+			/* 没收到包 0，无法确定目标槽，丢弃 */
+			frame_pool_free(frame.slot);
+			continue;
+		}
 
-		/* 边界保护：不能写到 config 区及以后 */
-		if (write_addr + DATA_FRAME_LEN > CONFIG_BASE)
+		write_addr = target_base + ((uint32_t)frame.current_packet * DATA_FRAME_LEN);
+
+		/* 边界保护：不能写穿目标槽容量 */
+		if (write_addr + DATA_FRAME_LEN > (target_base + SLOT_CAPACITY))
 		{
 			frame_pool_free(frame.slot);
 			continue;
 		}
 
-		/* Flash 只能把 1 写成 0，写入前必须先擦除所在页（按页惰性擦除，每 4 帧一次） */
 		{
-			int32_t page = (int32_t)((write_addr - OTA_BUFFER_BASE) / FLASH_PAGE_SIZE);
-			if (page != erased_page)
+			uint32_t sector_base = get_sector_base(write_addr);
+
+			/* 首次写到一个扇区时才擦除；擦除单位取该扇区的真实大小（16/64/128KB） */
+			if (sector_base != erased_sector_base)
 			{
-				if (flash_erase(OTA_BUFFER_BASE + (uint32_t)page * FLASH_PAGE_SIZE,
-								FLASH_PAGE_SIZE) != Status_OK)
+				uint32_t sector_size = get_sector_size(get_sector(sector_base));
+
+				if (flash_erase(sector_base, sector_size) != Status_OK)
 				{
 					frame_pool_free(frame.slot);
 					continue;
 				}
-				erased_page = page;
+				erased_sector_base = sector_base;
 			}
 		}
 
 		/* 写 Flash，只写实际长度，不写 padding */
 		if (flash_write(write_addr, frame.slot->buf, frame.data_len) == Status_OK)
 			received_count++; /* 写入成功，计入已收帧数 */
-		else
-		{
-			/* 写失败，可以记录错误，忽略 */
-		}
 
 		/* 归还 slot */
 		frame_pool_free(frame.slot);
@@ -528,31 +582,61 @@ void request_upgradeTask(void const *argument)
 
 	for (;;)
 	{
+		ota_config_t meta;
+		uint8_t current_slot;
+		uint8_t target_slot;
+		int ret;
 
-		static const char msg[] = "here is request_upgradeTask!\r\n";
-		uart_send((const uint8_t *)msg, sizeof(msg) - 1);
-		osDelay(1000);
-		
-		/* 等待 task_ota_flash 发来的升级通知 */
+		/* 等待 ota_flashTask 完成“下载 + 全量校验” */
 		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
 
 		if (xWifisendTaskHandle != NULL)
 			xTaskNotify(xWifisendTaskHandle, 0x02, eSetValueWithOverwrite);
-		ota_config_t config;
-		config.magic = OTA_MAGIC;
-		config.update_flag = 1;
-		config.version = CURRENT_VERSION;
-		config.firmware_size = g_firmware_size;
-		config.crc32 = g_firmware_crc;
 
-		__disable_irq(); // 关闭全局中断，防止读写过程被打断
+		target_slot = (uint8_t)g_target_slot;
+		if (target_slot > 1U || g_firmware_size == 0U)
+			continue;
 
-		// 擦除配置区所在页，写入 config
-		flash_erase(CONFIG_BASE, sizeof(ota_config_t));
-		flash_write(CONFIG_BASE, (uint8_t *)&config, sizeof(ota_config_t));
+		/* 当前运行槽一定是目标槽的另一半 */
+		current_slot = (uint8_t)(target_slot ^ 1U);
 
-		// 软复位
-		NVIC_SystemReset();
+		if (ota_meta_load(&meta) != 0)
+		{
+			/* 元数据缺失（工厂状态）：把当前实际运行的槽登记为 VALID */
+			memset(&meta, 0, sizeof(meta));
+			meta.active_slot = current_slot;
+			meta.slot_state[current_slot] = SLOT_STATE_VALID;
+			meta.version[current_slot] = CURRENT_VERSION;
+		}
+
+		/*
+		 * 切换标志：active_slot 指向新槽，Bootloader 下次启动直接跳过去。
+		 * trial_pending 置 1，新固件真正跑起来后由 ota_app_boot_confirm() 清零。
+		 */
+		meta.magic = OTA_META_MAGIC;
+		meta.active_slot = target_slot;
+		meta.trial_pending = 1;
+		meta.slot_state[target_slot] = SLOT_STATE_VALID;
+		meta.slot_state[current_slot] = SLOT_STATE_VALID;
+		meta.version[target_slot] = CURRENT_VERSION;  /* 新固件启动后会修正为自己的版本 */
+		meta.firmware_size = g_firmware_size;
+		meta.fw_crc = g_firmware_crc;
+		memset(meta.rx_bitmap, 0, sizeof(meta.rx_bitmap));
+
+		/* 写非活动副本 + 读回校验，成功后再复位 */
+		ret = ota_meta_save(&meta);
+		if (ret == 0)
+		{
+			static const char ok[] = "upgrade ok, reboot to new slot...\r\n";
+			uart_send((const uint8_t *)ok, sizeof(ok) - 1);
+			osDelay(50);
+			NVIC_SystemReset();
+		}
+		else
+		{
+			static const char err[] = "meta save fail!\r\n";
+			uart_send((const uint8_t *)err, sizeof(err) - 1);
+		}
 	}
 	/* USER CODE END request_upgradeTask */
 }

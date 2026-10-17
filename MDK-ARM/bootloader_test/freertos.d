@@ -47,7 +47,8 @@ bootloader_test\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/t
 bootloader_test\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/queue.h
 bootloader_test\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/semphr.h
 bootloader_test\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/event_groups.h
+bootloader_test\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
+bootloader_test\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h
 bootloader_test\freertos.o: ../Core/Inc/usart.h
 bootloader_test\freertos.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/stream_buffer.h
 bootloader_test\freertos.o: ../Core/Inc/ota_receive.h
-bootloader_test\freertos.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h

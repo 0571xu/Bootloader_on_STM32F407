@@ -1,7 +1,7 @@
 /**************************************
  * 文件名  ：ota_receive.c
- * 描述    ：OTA 帧接收、CRC 校验、Flash 写入
- * 说明    ：配合 uart.c 中串口接收的功能实现
+ * 描述    ：OTA 帧接收、CRC 校验、Flash 写入、元数据双副本
+ * 说明    ：配合 usart.c 中串口接收的功能实现
  *********************************************************/
  
 #include "main.h"
@@ -97,43 +97,167 @@ uint32_t calculate_crc32_ex(uint8_t total, uint8_t current, uint16_t len, uint8_
     return CRC->DR;
 }
 
+/*
+ * 整包 / 元数据 CRC：按小端组字，尾部不足 4 字节用 0xFF 补齐。
+ * 与 Bootloader 中的实现必须完全一致。
+ */
+uint32_t ota_crc32_bytes(const void *data, uint32_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t i;
+    uint32_t j;
+    uint32_t word;
 
+    __HAL_RCC_CRC_CLK_ENABLE();
+    CRC->CR = CRC_CR_RESET;
 
+    for (i = 0; i + 4U <= len; i += 4U) {
+        word = (uint32_t)p[i]
+             | ((uint32_t)p[i + 1U] << 8)
+             | ((uint32_t)p[i + 2U] << 16)
+             | ((uint32_t)p[i + 3U] << 24);
+        CRC->DR = word;
+    }
 
-// Flash 擦除
+    if (i < len) {
+        word = 0xFFFFFFFFU;
+        for (j = 0; i + j < len; j++) {
+            word &= ~(0xFFU << (8U * j));
+            word |= ((uint32_t)p[i + j] << (8U * j));
+        }
+        CRC->DR = word;
+    }
+
+    return CRC->DR;
+}
+
+/* ==================== 扇区信息 ==================== */
+
+/* 获取指定地址所在的扇区编号 (F407 专用) */
+uint32_t get_sector(uint32_t addr)
+{
+    if (addr < 0x08004000U) return FLASH_SECTOR_0;
+    if (addr < 0x08008000U) return FLASH_SECTOR_1;
+    if (addr < 0x0800C000U) return FLASH_SECTOR_2;
+    if (addr < 0x08010000U) return FLASH_SECTOR_3;
+    if (addr < 0x08020000U) return FLASH_SECTOR_4;  /* 64KB */
+    if (addr < 0x08040000U) return FLASH_SECTOR_5;  /* 128KB 开始 */
+    if (addr < 0x08060000U) return FLASH_SECTOR_6;
+    if (addr < 0x08080000U) return FLASH_SECTOR_7;
+    if (addr < 0x080A0000U) return FLASH_SECTOR_8;
+    if (addr < 0x080C0000U) return FLASH_SECTOR_9;
+    if (addr < 0x080E0000U) return FLASH_SECTOR_10;
+    return FLASH_SECTOR_11;
+}
+
+uint32_t get_sector_base(uint32_t addr)
+{
+    if (addr < 0x08004000U) return 0x08000000U;
+    if (addr < 0x08008000U) return 0x08004000U;
+    if (addr < 0x0800C000U) return 0x08008000U;
+    if (addr < 0x08010000U) return 0x0800C000U;
+    if (addr < 0x08020000U) return 0x08010000U;
+    if (addr < 0x08040000U) return 0x08020000U;
+    if (addr < 0x08060000U) return 0x08040000U;
+    if (addr < 0x08080000U) return 0x08060000U;
+    if (addr < 0x080A0000U) return 0x08080000U;
+    if (addr < 0x080C0000U) return 0x080A0000U;
+    if (addr < 0x080E0000U) return 0x080C0000U;
+    return 0x080E0000U;
+}
+
+uint32_t get_sector_size(uint32_t sector)
+{
+    if (sector <= FLASH_SECTOR_3) {
+        return 16U * 1024U;
+    }
+    if (sector == FLASH_SECTOR_4) {
+        return 64U * 1024U;
+    }
+    return 128U * 1024U;
+}
+
+/* ==================== Flash 擦写（带区域保护） ==================== */
+
+typedef struct {
+    uint32_t start;
+    uint32_t end;      /* 不包含 */
+} flash_region_t;
+
+/*
+ * 只允许擦写这四个区域。Bootloader、以及任何越界地址都会被直接拒绝，
+ * 避免 firmware_size 异常或地址算错时误擦 Bootloader / 元数据。
+ * B 槽的物理末端是 0x08100000（S11 末尾），但镜像可用上限仍由 SLOT_CAPACITY 限制。
+ */
+static const flash_region_t g_flash_regions[] = {
+    { SLOT_A_BASE,  SLOT_A_END },
+    { SLOT_B_BASE,  SLOT_B_ERASE_END },
+    { META0_BASE,   META0_BASE + META_SECTOR_SIZE },
+    { META1_BASE,   META1_BASE + META_SECTOR_SIZE }
+};
+
+static int flash_range_allowed(uint32_t start, uint32_t size)
+{
+    uint32_t end;
+    uint32_t i;
+
+    if (size == 0U) {
+        return 0;
+    }
+    if (start > 0xFFFFFFFFU - size) {
+        return 0;
+    }
+    end = start + size;
+
+    for (i = 0; i < (sizeof(g_flash_regions) / sizeof(g_flash_regions[0])); i++) {
+        if (start >= g_flash_regions[i].start && end <= g_flash_regions[i].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Flash 擦除 (按扇区粒度，支持跨扇区连续擦除) */
 StatusTypeDef flash_erase(uint32_t start_addr, uint32_t size)
 {
     FLASH_EraseInitTypeDef erase_init;
-    uint32_t page_error = 0;
-    uint32_t page_addr  = start_addr & ~(FLASH_PAGE_SIZE - 1);
-    uint32_t end_addr   = start_addr + size;
+    uint32_t sector_error = 0;
+    uint32_t start_sector;
+    uint32_t end_sector;
+
+    if (!flash_range_allowed(start_addr, size)) {
+        return Status_ERROR;
+    }
+
+    start_sector = get_sector(start_addr);
+    end_sector   = get_sector(start_addr + size - 1U);
 
     if (HAL_FLASH_Unlock() != HAL_OK)
         return Status_ERROR;
 
-    while (page_addr < end_addr) {
-        /* STM32F407 前 4 个扇区(0~3)每扇区 16KB，OTA 区与 config 区都在这一段 */
-        erase_init.TypeErase    = FLASH_TYPEERASE_SECTORS;
-        erase_init.VoltageRange = FLASH_VOLTAGE_RANGE_3;
-        erase_init.Sector       = (page_addr - FLASH_BASE) / 0x4000U;
-        erase_init.NbSectors    = 1;
+    erase_init.TypeErase    = FLASH_TYPEERASE_SECTORS;
+    erase_init.VoltageRange = FLASH_VOLTAGE_RANGE_3; // 2.7V~3.6V
+    erase_init.Sector       = start_sector;
+    erase_init.NbSectors    = end_sector - start_sector + 1U; // 计算连续要擦除的扇区数
 
-        if (HAL_FLASHEx_Erase(&erase_init, &page_error) != HAL_OK) {
-            HAL_FLASH_Lock();
-            return Status_ERROR;
-        }
-        page_addr += FLASH_PAGE_SIZE;
+    if (HAL_FLASHEx_Erase(&erase_init, &sector_error) != HAL_OK) {
+        HAL_FLASH_Lock();
+        return Status_ERROR;
     }
 
     HAL_FLASH_Lock();
     return Status_OK;
 }
 
-// Flash 写入
+/* Flash 写入 */
 StatusTypeDef flash_write(uint32_t dest_addr, uint8_t *src, uint32_t size)
 {
     uint32_t i;
     uint32_t word;
+
+    if (!flash_range_allowed(dest_addr, size)) {
+        return Status_ERROR;
+    }
 
     if (HAL_FLASH_Unlock() != HAL_OK)
         return Status_ERROR;
@@ -160,4 +284,194 @@ StatusTypeDef flash_write(uint32_t dest_addr, uint8_t *src, uint32_t size)
     return Status_OK;
 }
 
+/* ==================== 元数据双副本 ==================== */
 
+static uint32_t ota_meta_crc(const ota_config_t *cfg)
+{
+    ota_config_t tmp;
+
+    memcpy(&tmp, cfg, sizeof(tmp));
+    memset(&tmp.meta_crc, 0xFF, sizeof(tmp.meta_crc));  /* 计算时该字段按 0xFFFFFFFF */
+
+    return ota_crc32_bytes(&tmp, sizeof(tmp));
+}
+
+static int ota_meta_is_valid(const ota_config_t *cfg)
+{
+    if (cfg->magic != OTA_META_MAGIC) {
+        return 0;
+    }
+    if (cfg->active_slot > 1U) {
+        return 0;
+    }
+    if (cfg->slot_state[0] > SLOT_STATE_INVALID ||
+        cfg->slot_state[1] > SLOT_STATE_INVALID) {
+        return 0;
+    }
+    if (cfg->firmware_size > SLOT_CAPACITY) {
+        return 0;
+    }
+    return (ota_meta_crc(cfg) == cfg->meta_crc) ? 1 : 0;
+}
+
+/*
+ * 读元数据：两份副本分别校验 magic + meta_crc，取 seq 较大的一份。
+ * 返回 0 成功，-1 表示两份都无效。
+ */
+int ota_meta_load(ota_config_t *out)
+{
+    const ota_config_t *copy0 = (const ota_config_t *)META0_BASE;
+    const ota_config_t *copy1 = (const ota_config_t *)META1_BASE;
+    int valid0 = ota_meta_is_valid(copy0);
+    int valid1 = ota_meta_is_valid(copy1);
+
+    if (!valid0 && !valid1) {
+        return -1;
+    }
+
+    if (valid1 && (!valid0 || copy1->seq > copy0->seq)) {
+        memcpy(out, copy1, sizeof(*out));
+    } else {
+        memcpy(out, copy0, sizeof(*out));
+    }
+
+    return 0;
+}
+
+/* 选一个“非活动副本”作为本次写入目标：优先无效副本，其次 seq 较小的旧副本 */
+static uint32_t ota_meta_write_addr(void)
+{
+    const ota_config_t *copy0 = (const ota_config_t *)META0_BASE;
+    const ota_config_t *copy1 = (const ota_config_t *)META1_BASE;
+    int valid0 = ota_meta_is_valid(copy0);
+    int valid1 = ota_meta_is_valid(copy1);
+
+    if (!valid0) {
+        return META0_BASE;
+    }
+    if (!valid1) {
+        return META1_BASE;
+    }
+    return (copy0->seq <= copy1->seq) ? META0_BASE : META1_BASE;
+}
+
+/*
+ * 写元数据：写非活动副本 → 读回校验 → 下一次读取时 seq 更大的新副本生效。
+ * 由于写入目标始终是另一份副本所在扇区，擦除过程中活动副本不会被破坏。
+ */
+int ota_meta_save(ota_config_t *cfg)
+{
+    ota_config_t current;
+    uint32_t addr;
+
+    cfg->magic = OTA_META_MAGIC;
+    cfg->seq   = (ota_meta_load(&current) == 0) ? (current.seq + 1U) : 1U;
+    addr       = ota_meta_write_addr();
+
+    cfg->meta_crc = ota_meta_crc(cfg);
+
+    if (flash_erase(addr, META_SECTOR_SIZE) != Status_OK) {
+        return -1;
+    }
+    if (flash_write(addr, (uint8_t *)cfg, sizeof(*cfg)) != Status_OK) {
+        return -2;
+    }
+    if (memcmp((const void *)addr, cfg, sizeof(*cfg)) != 0) {
+        return -3;
+    }
+
+    return 0;
+}
+
+/* ==================== APP 启动确认 ==================== */
+
+/* 检查槽内固件的向量表：SP 落在 SRAM，复位向量落在本槽范围内 */
+int ota_image_vectors_valid(uint32_t slot_base)
+{
+    uint32_t sp = *(__IO uint32_t *)slot_base;
+    uint32_t reset_vector = *(__IO uint32_t *)(slot_base + 4U);
+
+    if ((sp & 0x7U) != 0U) {
+        return 0;
+    }
+    if (sp < 0x20000000U || sp > 0x20020000U) {   /* F407VG: 128KB SRAM */
+        return 0;
+    }
+
+    reset_vector &= ~1U;
+    if (reset_vector < slot_base || reset_vector >= (slot_base + SLOT_CAPACITY)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int ota_slot_index_from_base(uint32_t image_base)
+{
+    if (image_base == SLOT_A_BASE) {
+        return 0;
+    }
+    if (image_base == SLOT_B_BASE) {
+        return 1;
+    }
+    return -1;
+}
+
+/*
+ * APP 每次启动时调用：
+ *   1. 元数据缺失 → 用当前运行的槽建立第一份元数据（工厂镜像，size/crc 未知）；
+ *   2. active_slot 与实际运行槽不一致 → 说明 Bootloader 做了回退，修正为当前槽；
+ *   3. trial_pending == 1 → 新固件已经真正跑起来了，确认并清零；
+ *   4. version 记录为当前固件版本。
+ */
+void ota_app_boot_confirm(uint32_t image_base)
+{
+    ota_config_t meta;
+    int slot = ota_slot_index_from_base(image_base);
+    int dirty = 0;
+
+    if (slot < 0) {
+        return;   /* 镜像链接地址不在 A/B 槽内，不写元数据 */
+    }
+
+    if (ota_meta_load(&meta) != 0) {
+        memset(&meta, 0, sizeof(meta));
+        meta.magic = OTA_META_MAGIC;
+        meta.active_slot = (uint8_t)slot;
+        meta.slot_state[slot] = SLOT_STATE_VALID;
+        meta.version[slot] = CURRENT_VERSION;
+        meta.firmware_size = 0;   /* 工厂镜像没有 CRC 信息，Bootloader 跳过整包校验 */
+        meta.fw_crc = 0;
+        meta.trial_pending = 0;
+        ota_meta_save(&meta);
+        return;
+    }
+
+    if (meta.active_slot != (uint8_t)slot) {
+        /*
+         * Bootloader 做了回退，说明 active_slot 指向的槽没能启动。
+         * 此时 firmware_size/fw_crc 描述的是另一个槽，不能套用到当前槽，
+         * 否则下次启动会拿错误的长度/CRC 去校验，导致反复回退。
+         */
+        meta.active_slot = (uint8_t)slot;
+        meta.firmware_size = 0U;
+        meta.fw_crc = 0U;
+        dirty = 1;
+    }
+    if (meta.slot_state[slot] != SLOT_STATE_VALID) {
+        meta.slot_state[slot] = SLOT_STATE_VALID;
+        dirty = 1;
+    }
+    if (meta.version[slot] != CURRENT_VERSION) {
+        meta.version[slot] = CURRENT_VERSION;
+        dirty = 1;
+    }
+    if (meta.trial_pending != 0) {
+        meta.trial_pending = 0;
+        dirty = 1;
+    }
+
+    if (dirty) {
+        ota_meta_save(&meta);
+    }
+}
