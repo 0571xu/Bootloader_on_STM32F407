@@ -223,19 +223,19 @@ void wifi_getTask(void const *argument)
 		 * 注意：这里不能调用 osDelay()，否则整个循环被拖成 1 字节/秒，
 		 * OTA 数据会被 StreamBuffer 丢弃，永远收不到结束帧。
 		 */
-//		if ((xTaskGetTickCount() - last_report) >= pdMS_TO_TICKS(1000))
-//		{
-//			char version_str[32];
-//			last_report = xTaskGetTickCount();
+		if ((xTaskGetTickCount() - last_report) >= pdMS_TO_TICKS(1000))
+		{
+			char version_str[32];
+			last_report = xTaskGetTickCount();
 
-//			/* 将 0x00010001 拆解成 V1.1 的字符串 */
-//			sprintf(version_str, "Version: V%d.%d\r\n",
-//			        (CURRENT_VERSION >> 16) & 0xFF, CURRENT_VERSION & 0xFF);
-//			uart_send((uint8_t *)version_str, strlen(version_str));
+			/* 将 0x00010001 拆解成 V1.1 的字符串 */
+			sprintf(version_str, "Version: V%d.%d\r\n",
+			        (CURRENT_VERSION >> 16) & 0xFF, CURRENT_VERSION & 0xFF);
+			uart_send((uint8_t *)version_str, strlen(version_str));
 
-//			static const char msg[] = "here is wifi_getTask!\r\n";
-//			uart_send((const uint8_t *)msg, sizeof(msg) - 1);
-//		}
+			static const char msg[] = "here is wifi_getTask!\r\n";
+			uart_send((const uint8_t *)msg, sizeof(msg) - 1);
+		}
 
 		/* 一次读一个字节；20ms 超时只是为了回到循环顶部打印状态 */
 		if (xStreamBufferReceive(uartStreamBuffer, &byte, 1, pdMS_TO_TICKS(20)) != 1)

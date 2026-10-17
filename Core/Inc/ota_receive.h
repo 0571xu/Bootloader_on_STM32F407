@@ -55,7 +55,7 @@
 
 /* ==================== OTA 参数区结构 ==================== */
 #define OTA_META_MAGIC      0x4F544131U      /* "OTA1"，与 Bootloader 保持一致 */
-#define CURRENT_VERSION     0x00010000U      /* V1.0 */
+#define CURRENT_VERSION     0x00010003U      /* V1.0 */
 
 #define OTA_MAX_TOTAL_CHUNKS        2048U
 #define OTA_BITMAP_WORD_COUNT       ((OTA_MAX_TOTAL_CHUNKS + 7U) / 8U)  /* 每 8 包 1 字节 */
