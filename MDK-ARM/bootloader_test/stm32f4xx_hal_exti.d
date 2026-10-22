@@ -25,10 +25,10 @@ bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_flash.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_flash_ex.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_flash_ramfunc.h
-bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_i2c.h
-bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_i2c_ex.h
+bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_iwdg.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr_ex.h
+bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_spi.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h
 bootloader_test\stm32f4xx_hal_exti.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h

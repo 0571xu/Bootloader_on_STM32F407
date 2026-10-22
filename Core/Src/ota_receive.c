@@ -301,14 +301,18 @@ static int ota_meta_is_valid(const ota_config_t *cfg)
     if (cfg->magic != OTA_META_MAGIC) {
         return 0;
     }
-    if (cfg->active_slot > 1U) {
+    if (cfg->active_slot > 1U || cfg->prev_slot > 1U) {
+        return 0;
+    }
+    if (cfg->trial_pending > 1U) {
         return 0;
     }
     if (cfg->slot_state[0] > SLOT_STATE_INVALID ||
         cfg->slot_state[1] > SLOT_STATE_INVALID) {
         return 0;
     }
-    if (cfg->firmware_size > SLOT_CAPACITY) {
+    if (cfg->slot_size[0] > SLOT_CAPACITY ||
+        cfg->slot_size[1] > SLOT_CAPACITY) {
         return 0;
     }
     return (ota_meta_crc(cfg) == cfg->meta_crc) ? 1 : 0;
@@ -418,13 +422,14 @@ static int ota_slot_index_from_base(uint32_t image_base)
 }
 
 /*
- * APP 每次启动时调用：
+ * APP 每次启动时调用（不负责试运行确认）：
  *   1. 元数据缺失 → 用当前运行的槽建立第一份元数据（工厂镜像，size/crc 未知）；
- *   2. active_slot 与实际运行槽不一致 → 说明 Bootloader 做了回退，修正为当前槽；
- *   3. trial_pending == 1 → 新固件已经真正跑起来了，确认并清零；
- *   4. version 记录为当前固件版本。
+ *   2. active_slot 与实际运行槽不一致 → 说明 Bootloader 做了回退，修正为当前槽，
+ *      并把启动失败的另一个槽标记为 INVALID；
+ *   3. version 记录为当前固件版本；
+ *   4. trial_pending 原样保留，等心跳任务确认健康后再清。
  */
-void ota_app_boot_confirm(uint32_t image_base)
+void ota_app_boot_init(uint32_t image_base)
 {
     ota_config_t meta;
     int slot = ota_slot_index_from_base(image_base);
@@ -438,10 +443,11 @@ void ota_app_boot_confirm(uint32_t image_base)
         memset(&meta, 0, sizeof(meta));
         meta.magic = OTA_META_MAGIC;
         meta.active_slot = (uint8_t)slot;
+        meta.prev_slot = (uint8_t)(slot ^ 1);
         meta.slot_state[slot] = SLOT_STATE_VALID;
         meta.version[slot] = CURRENT_VERSION;
-        meta.firmware_size = 0;   /* 工厂镜像没有 CRC 信息，Bootloader 跳过整包校验 */
-        meta.fw_crc = 0;
+        meta.slot_size[slot] = 0;   /* 工厂镜像没有 CRC 信息，Bootloader 跳过整包校验 */
+        meta.slot_crc[slot] = 0;
         meta.trial_pending = 0;
         ota_meta_save(&meta);
         return;
@@ -449,13 +455,16 @@ void ota_app_boot_confirm(uint32_t image_base)
 
     if (meta.active_slot != (uint8_t)slot) {
         /*
-         * Bootloader 做了回退，说明 active_slot 指向的槽没能启动。
-         * 此时 firmware_size/fw_crc 描述的是另一个槽，不能套用到当前槽，
-         * 否则下次启动会拿错误的长度/CRC 去校验，导致反复回退。
+         * active_slot 指向的槽没能启动，Bootloader 回退到了当前槽。
+         * 新的 Bootloader 会自己写回元数据，这里只做兜底：
+         * 修正 active_slot，并把启动失败的槽标记为 INVALID，避免反复尝试。
          */
+        uint8_t failed = meta.active_slot;
+        meta.prev_slot = failed;
         meta.active_slot = (uint8_t)slot;
-        meta.firmware_size = 0U;
-        meta.fw_crc = 0U;
+        meta.slot_state[failed] = SLOT_STATE_INVALID;
+        meta.trial_pending = 0;
+        meta.trial_count = 0;
         dirty = 1;
     }
     if (meta.slot_state[slot] != SLOT_STATE_VALID) {
@@ -466,12 +475,35 @@ void ota_app_boot_confirm(uint32_t image_base)
         meta.version[slot] = CURRENT_VERSION;
         dirty = 1;
     }
-    if (meta.trial_pending != 0) {
-        meta.trial_pending = 0;
-        dirty = 1;
-    }
 
     if (dirty) {
         ota_meta_save(&meta);
     }
+}
+
+/*
+ * 心跳任务在“所有关键任务连续健康运行 OTA_CONFIRM_WINDOW_MS”后调用。
+ * 只有 trial_pending == 1 且当前运行的正是 active_slot 时才确认。
+ */
+int ota_app_confirm_healthy(uint32_t image_base)
+{
+    ota_config_t meta;
+    int slot = ota_slot_index_from_base(image_base);
+
+    if (slot < 0) {
+        return -1;
+    }
+    if (ota_meta_load(&meta) != 0) {
+        return -1;
+    }
+    if (meta.active_slot != (uint8_t)slot || meta.trial_pending == 0U) {
+        return 0;   /* 没有待确认的试运行 */
+    }
+
+    meta.trial_pending = 0;
+    meta.trial_count = 0;
+    if (ota_meta_save(&meta) != 0) {
+        return -1;
+    }
+    return 1;
 }

@@ -26,10 +26,10 @@ bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_flash.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_flash_ex.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_flash_ramfunc.h
-bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_i2c.h
-bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_i2c_ex.h
+bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_iwdg.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_pwr_ex.h
+bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_spi.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_tim_ex.h
 bootloader_test_slotb\main.o: ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h
@@ -48,7 +48,8 @@ bootloader_test_slotb\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include
 bootloader_test_slotb\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/semphr.h
 bootloader_test_slotb\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/event_groups.h
 bootloader_test_slotb\main.o: ../Core/Inc/dma.h
-bootloader_test_slotb\main.o: ../Core/Inc/i2c.h
+bootloader_test_slotb\main.o: ../Core/Inc/iwdg.h
+bootloader_test_slotb\main.o: ../Core/Inc/spi.h
 bootloader_test_slotb\main.o: ../Core/Inc/usart.h
 bootloader_test_slotb\main.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/stream_buffer.h
 bootloader_test_slotb\main.o: ../Core/Inc/gpio.h

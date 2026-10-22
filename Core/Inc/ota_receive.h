@@ -54,34 +54,41 @@
 #endif
 
 /* ==================== OTA 参数区结构 ==================== */
-#define OTA_META_MAGIC      0x4F544131U      /* "OTA1"，与 Bootloader 保持一致 */
-#define CURRENT_VERSION     0x00010003U      /* V1.0 */
+#define OTA_META_MAGIC      0x4F544132U      /* "OTA2"，与 Bootloader 保持一致 */
+#define CURRENT_VERSION     0x00010005U      /* V1.5 */
 
 #define OTA_MAX_TOTAL_CHUNKS        2048U
-#define OTA_BITMAP_WORD_COUNT       ((OTA_MAX_TOTAL_CHUNKS + 7U) / 8U)  /* 每 8 包 1 字节 */
+#define OTA_BITMAP_BYTES            ((OTA_MAX_TOTAL_CHUNKS + 7U) / 8U)  /* 每 8 包 1 字节 */
 
 #define SLOT_STATE_EMPTY    0U
 #define SLOT_STATE_VALID    1U
 #define SLOT_STATE_INVALID  2U
 
+/* 新固件连续健康运行多久才认为试运行通过（ms） */
+#define OTA_CONFIRM_WINDOW_MS       5000U
+
 #pragma pack(1)
 typedef struct {
-    uint32_t magic;          /* 固定标识 0x4F544131 */
+    uint32_t magic;          /* 固定标识 0x4F544132 */
     uint32_t seq;            /* 写入序号，越大越新（用于判定有效副本） */
     uint8_t  active_slot;    /* 本次启动的槽：0 = A，1 = B */
+    uint8_t  prev_slot;      /* 试运行失败时回滚到哪个槽 */
     uint8_t  trial_pending;  /* 1 = 新固件待确认 */
+    uint8_t  trial_count;    /* 试运行失败启动次数，达到上限则回滚 */
     uint8_t  slot_state[2];  /* 各槽状态：EMPTY / VALID / INVALID */
-    uint8_t  reserved;
+    uint8_t  dl_state;       /* 断点续传预留：0 = IDLE，1 = DOWNLOADING */
+    uint8_t  dl_slot;        /* 断点续传预留：本次下载目标槽 */
+    uint16_t dl_total;       /* 断点续传预留：本次下载总包数 */
+    uint32_t slot_size[2];   /* 各槽固件长度（0 表示未知，跳过整包 CRC） */
+    uint32_t slot_crc[2];    /* 各槽整包 CRC32 */
     uint32_t version[2];     /* 各槽固件版本号 */
-    uint32_t firmware_size;  /* 当前活动槽固件长度（0 表示未知，跳过 CRC） */
-    uint32_t fw_crc;         /* 当前活动槽整包 CRC32 */
-    uint8_t  rx_bitmap[OTA_BITMAP_WORD_COUNT];   /* 断点续传：已收包位图 */
+    uint8_t  rx_bitmap[OTA_BITMAP_BYTES];   /* 断点续传：已收包位图 */
     uint32_t meta_crc;       /* 本结构 CRC32，计算时该字段按 0xFFFFFFFF 处理 */
 } ota_config_t;
 #pragma pack()
 
 /* Bootloader 与 APP 的结构体布局必须一致 */
-typedef char ota_config_size_check[(sizeof(ota_config_t) == 289) ? 1 : -1];
+typedef char ota_config_size_check[(sizeof(ota_config_t) == 302) ? 1 : -1];
 
 /* ==================== 帧格式 ==================== */
 #define DATA_FRAME_LEN      256
@@ -151,8 +158,14 @@ uint32_t       ota_crc32_bytes(const void *data, uint32_t len);
 int            ota_meta_load(ota_config_t *out);
 int            ota_meta_save(ota_config_t *cfg);
 
-/* APP 启动时确认当前运行的槽，并清掉 trial_pending */
-void           ota_app_boot_confirm(uint32_t image_base);
+/* APP 启动：元数据缺失时建立首份配置，并修正与实际运行槽不一致的状态。
+ * 注意：这里不清 trial_pending，试运行确认交给心跳任务。 */
+void           ota_app_boot_init(uint32_t image_base);
+
+/* 心跳健康运行满 OTA_CONFIRM_WINDOW_MS 后调用：
+ * 1 = 确认成功（清掉 trial_pending），0 = 无需确认，-1 = 写入失败 */
+int            ota_app_confirm_healthy(uint32_t image_base);
+
 int            ota_image_vectors_valid(uint32_t slot_base);
 
 /* Flash 接口 */

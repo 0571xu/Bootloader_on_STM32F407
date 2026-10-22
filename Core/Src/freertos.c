@@ -29,9 +29,13 @@
 #include <stdio.h>
 #include "string.h"
 #include "usart.h"
+#include "iwdg.h"
 #include "ota_receive.h"
 #include "stream_buffer.h"
 #include "queue.h"
+#include "QDTFT_demo.h"
+#include "Lcd_Driver.h"
+#include "GUI.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,6 +45,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/*
+ * 心跳位图：每个关键任务每轮循环给自己置一位，
+ * feeddog 任务按 1s 窗口检查所有位是否都出现，全齐才喂狗。
+ * 这样 IWDG 保护的是“任务级存活”，而不只是“CPU 还在跑”。
+ */
+#define HB_WIFI         (1U << 0)
+#define HB_FLASH        (1U << 1)
+#define HB_UPGRADE      (1U << 2)
+#define HB_APP          (1U << 3)
+#define HB_ALL          (HB_WIFI | HB_FLASH | HB_UPGRADE | HB_APP)
+
+#define HB_CHECK_MS     100U
+#define HB_WINDOW_TICKS (1000U / HB_CHECK_MS)   /* 1s 内必须收到所有任务的心跳 */
 
 /* USER CODE END PD */
 
@@ -57,28 +75,46 @@ static uint32_t g_firmware_size = 0;
 static uint32_t g_firmware_crc  = 0;
 static uint32_t g_target_slot   = 0;   /* 本次下载写入的槽：0 = A，1 = B */
 
+/* 各关键任务的心跳位图，由 feeddog 任务按窗口收集 */
+static volatile uint32_t g_hb_mask = 0;
+
+/* 固件下载中 / 元数据写入中：两条流程不能同时操作 Flash */
+static volatile uint32_t g_ota_busy  = 0;
+static volatile uint32_t g_meta_busy = 0;
+
+static void hb_set(uint32_t bit)
+{
+	taskENTER_CRITICAL();
+	g_hb_mask |= bit;
+	taskEXIT_CRITICAL();
+}
+
 /* USER CODE END Variables */
 osThreadId ledHandle;
 osThreadId oledmenuHandle;
 osThreadId wifi_getHandle;
 osThreadId ota_flashHandle;
 osThreadId request_upgradeHandle;
+osThreadId lcdHandle;
+osThreadId feeddogTaskHandle;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
 /* USER CODE END FunctionPrototypes */
 
-void ledTask(void const *argument);
-void oledmenuTask(void const *argument);
-void wifi_getTask(void const *argument);
-void ota_flashTask(void const *argument);
-void request_upgradeTask(void const *argument);
+void ledTask(void const * argument);
+void oledmenuTask(void const * argument);
+void wifi_getTask(void const * argument);
+void ota_flashTask(void const * argument);
+void request_upgradeTask(void const * argument);
+void lcd_task(void const * argument);
+void feeddog(void const * argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
 /* GetIdleTaskMemory prototype (linked to static allocation support) */
-void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize);
+void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize );
 
 /* USER CODE BEGIN GET_IDLE_TASK_MEMORY */
 static StaticTask_t xIdleTaskTCBBuffer;
@@ -94,59 +130,67 @@ void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer, StackTyp
 /* USER CODE END GET_IDLE_TASK_MEMORY */
 
 /**
- * @brief  FreeRTOS initialization
- * @param  None
- * @retval None
- */
-void MX_FREERTOS_Init(void)
-{
-	/* USER CODE BEGIN Init */
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
 	/* 创建流缓冲区与队列：必须在任何任务使用它们之前调用 */
 	ota_receive_init();
-	/* USER CODE END Init */
+  /* USER CODE END Init */
 
-	/* USER CODE BEGIN RTOS_MUTEX */
+  /* USER CODE BEGIN RTOS_MUTEX */
 	/* add mutexes, ... */
-	/* USER CODE END RTOS_MUTEX */
+  /* USER CODE END RTOS_MUTEX */
 
-	/* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
 	/* add semaphores, ... */
-	/* USER CODE END RTOS_SEMAPHORES */
+  /* USER CODE END RTOS_SEMAPHORES */
 
-	/* USER CODE BEGIN RTOS_TIMERS */
+  /* USER CODE BEGIN RTOS_TIMERS */
 	/* start timers, add new ones, ... */
-	/* USER CODE END RTOS_TIMERS */
+  /* USER CODE END RTOS_TIMERS */
 
-	/* USER CODE BEGIN RTOS_QUEUES */
+  /* USER CODE BEGIN RTOS_QUEUES */
 	/* xFrameQueue / atQueue 由 ota_receive_init() 创建：元素分别是 fw_frame_t 和 AT_LINE_MAX 字节的行，
 	   不能用 CMSIS 消息队列（只支持 1/2/4/8 字节元素） */
-	/* USER CODE END RTOS_QUEUES */
+  /* USER CODE END RTOS_QUEUES */
 
-	/* Create the thread(s) */
-	/* definition and creation of led */
-	osThreadDef(led, ledTask, osPriorityNormal, 0, 128);
-	ledHandle = osThreadCreate(osThread(led), NULL);
+  /* Create the thread(s) */
+  /* definition and creation of led */
+  osThreadDef(led, ledTask, osPriorityNormal, 0, 128);
+  ledHandle = osThreadCreate(osThread(led), NULL);
 
-	/* definition and creation of oledmenu */
-	osThreadDef(oledmenu, oledmenuTask, osPriorityNormal, 0, 256);
-	oledmenuHandle = osThreadCreate(osThread(oledmenu), NULL);
+  /* definition and creation of oledmenu */
+  osThreadDef(oledmenu, oledmenuTask, osPriorityNormal, 0, 256);
+  oledmenuHandle = osThreadCreate(osThread(oledmenu), NULL);
 
-	/* definition and creation of wifi_get */
-	osThreadDef(wifi_get, wifi_getTask, osPriorityHigh, 0, 384);
-	wifi_getHandle = osThreadCreate(osThread(wifi_get), NULL);
+  /* definition and creation of wifi_get */
+  osThreadDef(wifi_get, wifi_getTask, osPriorityHigh, 0, 384);
+  wifi_getHandle = osThreadCreate(osThread(wifi_get), NULL);
 
-	/* definition and creation of ota_flash */
-	osThreadDef(ota_flash, ota_flashTask, osPriorityHigh, 0, 256);
-	ota_flashHandle = osThreadCreate(osThread(ota_flash), NULL);
+  /* definition and creation of ota_flash */
+  osThreadDef(ota_flash, ota_flashTask, osPriorityHigh, 0, 256);
+  ota_flashHandle = osThreadCreate(osThread(ota_flash), NULL);
 
-	/* definition and creation of request_upgrade */
-	osThreadDef(request_upgrade, request_upgradeTask, osPriorityNormal, 0, 128);
-	request_upgradeHandle = osThreadCreate(osThread(request_upgrade), NULL);
+  /* definition and creation of request_upgrade */
+  osThreadDef(request_upgrade, request_upgradeTask, osPriorityNormal, 0, 512);
+  request_upgradeHandle = osThreadCreate(osThread(request_upgrade), NULL);
 
-	/* USER CODE BEGIN RTOS_THREADS */
+  /* definition and creation of lcd */
+  osThreadDef(lcd, lcd_task, osPriorityBelowNormal, 0, 256);
+  lcdHandle = osThreadCreate(osThread(lcd), NULL);
+
+  /* definition and creation of feeddogTask */
+  osThreadDef(feeddogTask, feeddog, osPriorityHigh, 0, 512);
+  feeddogTaskHandle = osThreadCreate(osThread(feeddogTask), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
 	/* ota_flashTask 通过这个句柄通知 request_upgradeTask，必须在任务启动前绑定 */
 	xrequest_upgrade_taskHandle = request_upgradeHandle;
-	/* USER CODE END RTOS_THREADS */
+  /* USER CODE END RTOS_THREADS */
+
 }
 
 /* USER CODE BEGIN Header_ledTask */
@@ -156,20 +200,21 @@ void MX_FREERTOS_Init(void)
  * @retval None
  */
 /* USER CODE END Header_ledTask */
-void ledTask(void const *argument)
+void ledTask(void const * argument)
 {
-	/* USER CODE BEGIN ledTask */
+  /* USER CODE BEGIN ledTask */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1,GPIO_PIN_RESET);
     osDelay(500);
 
 	/* Infinite loop */
 	for (;;)
 	{
+		hb_set(HB_APP);
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_1);
 
 		osDelay(500);
 	}
-	/* USER CODE END ledTask */
+  /* USER CODE END ledTask */
 }
 
 /* USER CODE BEGIN Header_oledmenuTask */
@@ -179,9 +224,9 @@ void ledTask(void const *argument)
  * @retval None
  */
 /* USER CODE END Header_oledmenuTask */
-void oledmenuTask(void const *argument)
+void oledmenuTask(void const * argument)
 {
-	/* USER CODE BEGIN oledmenuTask */
+  /* USER CODE BEGIN oledmenuTask */
 	/* Infinite loop */
 	for (;;)
 	{
@@ -189,7 +234,7 @@ void oledmenuTask(void const *argument)
 		uart_send((const uint8_t *)msg, sizeof(msg) - 1);
 		osDelay(10000);
 	}
-	/* USER CODE END oledmenuTask */
+  /* USER CODE END oledmenuTask */
 }
 
 /* USER CODE BEGIN Header_wifi_getTask */
@@ -200,9 +245,9 @@ void oledmenuTask(void const *argument)
  */
 /* ==================== 逐字节解析帧状态机 + AT 行处理 ==================== */
 /* USER CODE END Header_wifi_getTask */
-void wifi_getTask(void const *argument)
+void wifi_getTask(void const * argument)
 {
-	/* USER CODE BEGIN wifi_getTask */
+  /* USER CODE BEGIN wifi_getTask */
 	/* Infinite loop */
 
 	uint8_t byte;
@@ -218,6 +263,8 @@ void wifi_getTask(void const *argument)
 
 	for (;;)
 	{
+		hb_set(HB_WIFI);
+
 		/*
 		 * 每秒打印一次状态。
 		 * 注意：这里不能调用 osDelay()，否则整个循环被拖成 1 字节/秒，
@@ -425,7 +472,7 @@ void wifi_getTask(void const *argument)
 			break;
 		}
 	}
-	/* USER CODE END wifi_getTask */
+  /* USER CODE END wifi_getTask */
 }
 
 /* USER CODE BEGIN Header_ota_flashTask */
@@ -436,9 +483,9 @@ void wifi_getTask(void const *argument)
  */
 /* ==================== Flash 写任务 ==================== */
 /* USER CODE END Header_ota_flashTask */
-void ota_flashTask(void const *argument)
+void ota_flashTask(void const * argument)
 {
-	/* USER CODE BEGIN ota_flashTask */
+  /* USER CODE BEGIN ota_flashTask */
 	/* Infinite loop */
 
 	fw_frame_t frame;
@@ -452,7 +499,10 @@ void ota_flashTask(void const *argument)
 
 	for (;;)
 	{
-		if (xQueueReceive(xFrameQueue, &frame, portMAX_DELAY) != pdTRUE)
+		hb_set(HB_FLASH);
+
+		/* 200ms 超时只是为了周期性回到循环顶部打卡，收帧仍按队列事件触发 */
+		if (xQueueReceive(xFrameQueue, &frame, pdMS_TO_TICKS(200)) != pdTRUE)
 			continue;
 
 		/* 判断是否是结束帧 */
@@ -505,6 +555,7 @@ void ota_flashTask(void const *argument)
 			received_count = 0;
 			erased_sector_base = 0xFFFFFFFFU;
 			target_base = 0;   /* 等待下一轮的包 0 */
+			g_ota_busy = 0;
 			continue;          /* 结束帧不写 Flash，直接继续 */
 		}
 
@@ -513,6 +564,7 @@ void ota_flashTask(void const *argument)
 		{
 			received_count = 0;
 			erased_sector_base = 0xFFFFFFFFU;
+			g_ota_busy = 1;    /* 下载期间禁止 feeddog 写元数据确认 */
 
 			/*
 			 * 只用“本镜像的链接地址”判断当前运行槽，不去猜元数据。
@@ -539,6 +591,12 @@ void ota_flashTask(void const *argument)
 			continue;
 		}
 
+		/* 等 feeddog 的元数据写入结束，避免两条流程同时操作 Flash */
+		while (g_meta_busy)
+		{
+			osDelay(10);
+		}
+
 		{
 			uint32_t sector_base = get_sector_base(write_addr);
 
@@ -563,7 +621,7 @@ void ota_flashTask(void const *argument)
 		/* 归还 slot */
 		frame_pool_free(frame.slot);
 	}
-	/* USER CODE END ota_flashTask */
+  /* USER CODE END ota_flashTask */
 }
 
 /* USER CODE BEGIN Header_request_upgradeTask */
@@ -573,9 +631,9 @@ void ota_flashTask(void const *argument)
  * @retval None
  */
 /* USER CODE END Header_request_upgradeTask */
-void request_upgradeTask(void const *argument)
+void request_upgradeTask(void const * argument)
 {
-	/* USER CODE BEGIN request_upgradeTask */
+  /* USER CODE BEGIN request_upgradeTask */
 	/* Infinite loop */
 
 	(void)argument;
@@ -587,8 +645,11 @@ void request_upgradeTask(void const *argument)
 		uint8_t target_slot;
 		int ret;
 
-		/* 等待 ota_flashTask 完成“下载 + 全量校验” */
-		xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+		hb_set(HB_UPGRADE);
+
+		/* 200ms 超时用于周期打卡；只有收到通知才继续升级流程 */
+		if (xTaskNotifyWait(0, 0, NULL, pdMS_TO_TICKS(200)) != pdTRUE)
+			continue;
 
 		if (xWifisendTaskHandle != NULL)
 			xTaskNotify(xWifisendTaskHandle, 0x02, eSetValueWithOverwrite);
@@ -604,27 +665,39 @@ void request_upgradeTask(void const *argument)
 		{
 			/* 元数据缺失（工厂状态）：把当前实际运行的槽登记为 VALID */
 			memset(&meta, 0, sizeof(meta));
+			meta.magic = OTA_META_MAGIC;
 			meta.active_slot = current_slot;
+			meta.prev_slot = target_slot;
 			meta.slot_state[current_slot] = SLOT_STATE_VALID;
 			meta.version[current_slot] = CURRENT_VERSION;
+			meta.slot_size[current_slot] = 0;
+			meta.slot_crc[current_slot] = 0;
 		}
 
 		/*
 		 * 切换标志：active_slot 指向新槽，Bootloader 下次启动直接跳过去。
-		 * trial_pending 置 1，新固件真正跑起来后由 ota_app_boot_confirm() 清零。
+		 * trial_pending 置 1，由新固件的心跳任务在健康运行 5s 后清零；
+		 * 若一直不确认，Bootloader 会在 trial_count 达到上限后回滚到 prev_slot。
 		 */
 		meta.magic = OTA_META_MAGIC;
+		meta.prev_slot = current_slot;
 		meta.active_slot = target_slot;
 		meta.trial_pending = 1;
+		meta.trial_count = 0;
 		meta.slot_state[target_slot] = SLOT_STATE_VALID;
 		meta.slot_state[current_slot] = SLOT_STATE_VALID;
 		meta.version[target_slot] = CURRENT_VERSION;  /* 新固件启动后会修正为自己的版本 */
-		meta.firmware_size = g_firmware_size;
-		meta.fw_crc = g_firmware_crc;
+		meta.slot_size[target_slot] = g_firmware_size;
+		meta.slot_crc[target_slot] = g_firmware_crc;
+		meta.dl_state = 0;
+		meta.dl_slot = target_slot;
+		meta.dl_total = 0;
 		memset(meta.rx_bitmap, 0, sizeof(meta.rx_bitmap));
 
 		/* 写非活动副本 + 读回校验，成功后再复位 */
+		g_meta_busy = 1;
 		ret = ota_meta_save(&meta);
+		g_meta_busy = 0;
 		if (ret == 0)
 		{
 			static const char ok[] = "upgrade ok, reboot to new slot...\r\n";
@@ -638,7 +711,101 @@ void request_upgradeTask(void const *argument)
 			uart_send((const uint8_t *)err, sizeof(err) - 1);
 		}
 	}
-	/* USER CODE END request_upgradeTask */
+  /* USER CODE END request_upgradeTask */
+}
+
+/* USER CODE BEGIN Header_lcd_task */
+/**
+* @brief Function implementing the lcd thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_lcd_task */
+void lcd_task(void const * argument)
+{
+  /* USER CODE BEGIN lcd_task */
+  
+  /* Infinite loop */
+  for(;;)
+  {
+	// QDTFT_Test_Demo();
+    osDelay(10);
+  }
+  /* USER CODE END lcd_task */
+}
+
+/* USER CODE BEGIN Header_feeddog */
+/**
+* @brief Function implementing the feeddogTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_feeddog */
+void feeddog(void const * argument)
+{
+  /* USER CODE BEGIN feeddog */
+	uint32_t seen = 0;
+	uint32_t ticks = 0;
+	uint32_t healthy_ms = 0;
+	int confirmed = 0;
+
+	(void)argument;
+
+	/*
+	 * 每 100ms 收集一次心跳，按 1s 窗口判定：
+	 *   - 窗口内四个关键任务都打过卡 → 喂狗；
+	 *   - 有任务缺席 → 不喂，交给 IWDG 复位（新固件会被 Bootloader 回滚）。
+	 * 连续 5s 健康后，确认本次试运行成功，清掉 trial_pending。
+	 */
+	for (;;)
+	{
+		taskENTER_CRITICAL();
+		seen |= g_hb_mask;
+		g_hb_mask = 0;
+		taskEXIT_CRITICAL();
+
+		if (++ticks >= HB_WINDOW_TICKS)
+		{
+			if (seen == HB_ALL)
+			{
+				HAL_IWDG_Refresh(&hiwdg);
+
+				if (!confirmed)
+				{
+					healthy_ms += 1000U;
+					/* 下载/写元数据期间不确认，避免和 ota_flashTask 抢 Flash */
+					if (healthy_ms >= OTA_CONFIRM_WINDOW_MS && !g_ota_busy)
+					{
+						int ret;
+						g_meta_busy = 1;
+						ret = ota_app_confirm_healthy(APP_IMAGE_BASE);
+						g_meta_busy = 0;
+
+						if (ret >= 0)
+						{
+							confirmed = 1;
+							if (ret == 1)
+							{
+								static const char msg[] = "trial confirmed\r\n";
+								uart_send((const uint8_t *)msg, sizeof(msg) - 1);
+							}
+						}
+					}
+				}
+			}
+			else
+			{
+				/* 有任务缺席：清零健康计时，且本窗口不喂狗 */
+				healthy_ms = 0;
+			}
+
+			seen = 0;
+			ticks = 0;
+		}
+
+		osDelay(HB_CHECK_MS);
+	}
+  /* USER CODE END feeddog */
 }
 
 /* Private application code --------------------------------------------------*/
